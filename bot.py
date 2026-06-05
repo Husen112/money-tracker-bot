@@ -1,12 +1,15 @@
 import telebot
 import sqlite3
 import os
+import csv
+import io
 from datetime import datetime
 from telebot import types
 
 TOKEN = os.environ.get("TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
+# ── Database ─────────────────────────────────
 def init_db():
     conn = sqlite3.connect("money.db")
     conn.execute("""
@@ -17,6 +20,27 @@ def init_db():
             amount REAL,
             category TEXT,
             note TEXT,
+            date TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            category TEXT,
+            amount REAL,
+            month TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS debts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            person TEXT,
+            amount REAL,
+            note TEXT,
+            status TEXT DEFAULT 'unpaid',
             date TEXT
         )
     """)
@@ -46,56 +70,146 @@ def get_summary(user_id):
 def get_history(user_id, limit=10):
     conn = sqlite3.connect("money.db")
     rows = conn.execute("""
-        SELECT type, amount, category, note, date
+        SELECT id, type, amount, category, note, date
         FROM transactions WHERE user_id=?
         ORDER BY id DESC LIMIT ?
     """, (user_id, limit)).fetchall()
     conn.close()
     return rows
 
+def delete_transaction(tid, user_id):
+    conn = sqlite3.connect("money.db")
+    conn.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (tid, user_id))
+    conn.commit()
+    conn.close()
+
+def get_all_transactions(user_id):
+    conn = sqlite3.connect("money.db")
+    rows = conn.execute("""
+        SELECT type, amount, category, note, date
+        FROM transactions WHERE user_id=?
+        ORDER BY date DESC
+    """, (user_id,)).fetchall()
+    conn.close()
+    return rows
+
+def set_budget(user_id, category, amount):
+    conn = sqlite3.connect("money.db")
+    month = datetime.now().strftime("%Y-%m")
+    conn.execute("DELETE FROM budgets WHERE user_id=? AND category=? AND month=?",
+                 (user_id, category, month))
+    conn.execute("INSERT INTO budgets VALUES (NULL,?,?,?,?)",
+                 (user_id, category, amount, month))
+    conn.commit()
+    conn.close()
+
+def get_budgets(user_id):
+    conn = sqlite3.connect("money.db")
+    month = datetime.now().strftime("%Y-%m")
+    rows = conn.execute("""
+        SELECT b.category, b.amount, COALESCE(SUM(t.amount),0)
+        FROM budgets b
+        LEFT JOIN transactions t ON t.user_id=b.user_id
+            AND t.category=b.category AND t.type='out' AND t.date LIKE ?
+        WHERE b.user_id=? AND b.month=?
+        GROUP BY b.category, b.amount
+    """, (f"%{month}%", user_id, month)).fetchall()
+    conn.close()
+    return rows
+
+def add_debt(user_id, tipe, person, amount, note):
+    conn = sqlite3.connect("money.db")
+    conn.execute("INSERT INTO debts VALUES (NULL,?,?,?,?,?,'unpaid',?)",
+        (user_id, tipe, person, amount, note,
+         datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def get_debts(user_id, status="unpaid"):
+    conn = sqlite3.connect("money.db")
+    rows = conn.execute("""
+        SELECT id, type, person, amount, note, date
+        FROM debts WHERE user_id=? AND status=?
+        ORDER BY id DESC
+    """, (user_id, status)).fetchall()
+    conn.close()
+    return rows
+
+def pay_debt(did, user_id):
+    conn = sqlite3.connect("money.db")
+    conn.execute("UPDATE debts SET status='paid' WHERE id=? AND user_id=?", (did, user_id))
+    conn.commit()
+    conn.close()
+
+# ── State ─────────────────────────────────────
 user_state = {}
 
+# ── Keyboards ────────────────────────────────
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("➕ Pemasukan", "➖ Pengeluaran")
     kb.row("📊 Rekap Bulan Ini", "📜 Riwayat")
+    kb.row("🎯 Budget", "💸 Hutang/Piutang")
+    kb.row("📤 Export CSV", "🗑️ Hapus Transaksi")
     return kb
 
 def cat_keyboard(tipe):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if tipe == "in":
-        cats = ["Gaji", "Freelance", "Investasi", "Lainnya"]
+        cats = ["Gaji", "Freelance", "Investasi", "Bonus", "Lainnya"]
     else:
-        cats = ["Makan", "Transportasi", "Belanja", "Tagihan", "Hiburan", "Kesehatan", "Lainnya"]
+        cats = ["Makan", "Transportasi", "Belanja", "Tagihan", "Hiburan", "Kesehatan", "Pendidikan", "Lainnya"]
     for i in range(0, len(cats), 2):
         kb.row(*cats[i:i+2])
     return kb
 
+def debt_type_keyboard():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("💰 Saya yang Hutang", "💵 Saya yang Piutang")
+    return kb
+
+def skip_keyboard():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("skip")
+    return kb
+
+# ── Handlers ──────────────────────────────────
 @bot.message_handler(commands=["start", "help"])
 def start(msg):
     bot.send_message(msg.chat.id,
         "👋 Selamat datang di *Money Tracker*!\n\n"
-        "Pilih menu di bawah untuk mulai mencatat keuanganmu.",
+        "💰 Catat pemasukan & pengeluaran\n"
+        "🎯 Set budget per kategori\n"
+        "💸 Catat hutang & piutang\n"
+        "📤 Export data ke CSV\n\n"
+        "Pilih menu di bawah untuk mulai:",
         parse_mode="Markdown", reply_markup=main_menu())
 
+# ── PEMASUKAN ─────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "➕ Pemasukan")
 def pemasukan(msg):
     user_state[msg.chat.id] = {"type": "in", "step": "amount"}
     bot.send_message(msg.chat.id, "💰 Masukkan jumlah pemasukan (Rp):",
                      reply_markup=types.ReplyKeyboardRemove())
 
+# ── PENGELUARAN ───────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "➖ Pengeluaran")
 def pengeluaran(msg):
     user_state[msg.chat.id] = {"type": "out", "step": "amount"}
     bot.send_message(msg.chat.id, "💸 Masukkan jumlah pengeluaran (Rp):",
                      reply_markup=types.ReplyKeyboardRemove())
 
+# ── REKAP ─────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📊 Rekap Bulan Ini")
 def rekap(msg):
     rows = get_summary(msg.chat.id)
+    budgets = get_budgets(msg.chat.id)
+    budget_dict = {b[0]: (b[1], b[2]) for b in budgets}
+
     if not rows:
         bot.send_message(msg.chat.id, "📭 Belum ada transaksi bulan ini.", reply_markup=main_menu())
         return
+
     total_in = total_out = 0
     lines = [f"📊 *Rekap {datetime.now().strftime('%B %Y')}*\n"]
     lines.append("*💚 PEMASUKAN*")
@@ -104,18 +218,28 @@ def rekap(msg):
             lines.append(f"  {cat}: Rp {amt:,.0f}")
             total_in += amt
     lines.append(f"  *Total: Rp {total_in:,.0f}*\n")
+
     lines.append("*❤️ PENGELUARAN*")
     for tipe, cat, amt in rows:
         if tipe == "out":
-            lines.append(f"  {cat}: Rp {amt:,.0f}")
+            if cat in budget_dict:
+                limit, spent = budget_dict[cat]
+                pct = (amt / limit * 100) if limit > 0 else 0
+                warn = "⚠️" if pct >= 80 else "✅"
+                lines.append(f"  {warn} {cat}: Rp {amt:,.0f} / {limit:,.0f} ({pct:.0f}%)")
+            else:
+                lines.append(f"  {cat}: Rp {amt:,.0f}")
             total_out += amt
     lines.append(f"  *Total: Rp {total_out:,.0f}*\n")
+
     sisa = total_in - total_out
     emoji = "✅" if sisa >= 0 else "⚠️"
     lines.append(f"{emoji} *Saldo: Rp {sisa:,.0f}*")
+
     bot.send_message(msg.chat.id, "\n".join(lines),
                      parse_mode="Markdown", reply_markup=main_menu())
 
+# ── RIWAYAT ───────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📜 Riwayat")
 def riwayat(msg):
     rows = get_history(msg.chat.id)
@@ -123,18 +247,124 @@ def riwayat(msg):
         bot.send_message(msg.chat.id, "📭 Belum ada transaksi.", reply_markup=main_menu())
         return
     lines = ["📜 *10 Transaksi Terakhir*\n"]
-    for tipe, amt, cat, note, date in rows:
+    for tid, tipe, amt, cat, note, date in rows:
         icon = "💚" if tipe == "in" else "❤️"
-        lines.append(f"{icon} *Rp {amt:,.0f}* — {cat}\n   {note or '-'} · {date}")
+        lines.append(f"{icon} *Rp {amt:,.0f}* — {cat}\n   {note or '-'} · {date}\n   ID: `{tid}`")
+    lines.append("\n_Gunakan menu 🗑️ Hapus Transaksi untuk menghapus_")
     bot.send_message(msg.chat.id, "\n".join(lines),
                      parse_mode="Markdown", reply_markup=main_menu())
 
+# ── HAPUS TRANSAKSI ───────────────────────────
+@bot.message_handler(func=lambda m: m.text == "🗑️ Hapus Transaksi")
+def hapus_menu(msg):
+    user_state[msg.chat.id] = {"step": "delete_id"}
+    bot.send_message(msg.chat.id,
+        "🗑️ Masukkan ID transaksi yang mau dihapus\n_(lihat ID di menu 📜 Riwayat)_",
+        parse_mode="Markdown", reply_markup=types.ReplyKeyboardRemove())
+
+# ── BUDGET ────────────────────────────────────
+@bot.message_handler(func=lambda m: m.text == "🎯 Budget")
+def budget_menu(msg):
+    rows = get_budgets(msg.chat.id)
+    lines = ["🎯 *Budget Bulan Ini*\n"]
+    if rows:
+        for cat, limit, spent in rows:
+            pct = (spent / limit * 100) if limit > 0 else 0
+            warn = "⚠️" if pct >= 80 else "✅"
+            sisa = limit - spent
+            lines.append(f"{warn} *{cat}*\n   Dipakai: Rp {spent:,.0f} / {limit:,.0f}\n   Sisa: Rp {sisa:,.0f} ({pct:.0f}%)")
+    else:
+        lines.append("Belum ada budget. Set budget dulu!")
+
+    lines.append("\n_Ketik /setbudget untuk set budget baru_")
+    bot.send_message(msg.chat.id, "\n".join(lines),
+                     parse_mode="Markdown", reply_markup=main_menu())
+
+@bot.message_handler(commands=["setbudget"])
+def set_budget_cmd(msg):
+    user_state[msg.chat.id] = {"step": "budget_category"}
+    bot.send_message(msg.chat.id, "🎯 Pilih kategori budget:",
+                     reply_markup=cat_keyboard("out"))
+
+# ── HUTANG/PIUTANG ────────────────────────────
+@bot.message_handler(func=lambda m: m.text == "💸 Hutang/Piutang")
+def debt_menu(msg):
+    hutang = get_debts(msg.chat.id, "unpaid")
+    total_hutang = sum(d[3] for d in hutang if d[1] == "hutang")
+    total_piutang = sum(d[3] for d in hutang if d[1] == "piutang")
+
+    lines = ["💸 *Hutang & Piutang*\n"]
+    lines.append("*🔴 Hutang Saya (belum bayar)*")
+    hutang_list = [d for d in hutang if d[1] == "hutang"]
+    if hutang_list:
+        for did, _, person, amt, note, date in hutang_list:
+            lines.append(f"  👤 {person}: Rp {amt:,.0f}\n   {note or '-'} · ID: `{did}`")
+    else:
+        lines.append("  Tidak ada hutang 🎉")
+
+    lines.append(f"\n*Total hutang: Rp {total_hutang:,.0f}*\n")
+
+    lines.append("*🟢 Piutang Saya (belum dibayar)*")
+    piutang_list = [d for d in hutang if d[1] == "piutang"]
+    if piutang_list:
+        for did, _, person, amt, note, date in piutang_list:
+            lines.append(f"  👤 {person}: Rp {amt:,.0f}\n   {note or '-'} · ID: `{did}`")
+    else:
+        lines.append("  Tidak ada piutang")
+
+    lines.append(f"\n*Total piutang: Rp {total_piutang:,.0f}*\n")
+    lines.append("_/tambah\_hutang — catat hutang/piutang baru_\n_/lunas [ID] — tandai sudah lunas_")
+
+    bot.send_message(msg.chat.id, "\n".join(lines),
+                     parse_mode="Markdown", reply_markup=main_menu())
+
+@bot.message_handler(commands=["tambah_hutang"])
+def tambah_hutang(msg):
+    user_state[msg.chat.id] = {"step": "debt_type"}
+    bot.send_message(msg.chat.id, "💸 Pilih jenis:", reply_markup=debt_type_keyboard())
+
+@bot.message_handler(commands=["lunas"])
+def lunas_cmd(msg):
+    parts = msg.text.split()
+    if len(parts) < 2:
+        bot.send_message(msg.chat.id, "Format: /lunas [ID]\nContoh: /lunas 3")
+        return
+    try:
+        did = int(parts[1])
+        pay_debt(did, msg.chat.id)
+        bot.send_message(msg.chat.id, f"✅ Hutang/piutang ID {did} sudah ditandai lunas!", reply_markup=main_menu())
+    except:
+        bot.send_message(msg.chat.id, "❌ ID tidak valid.")
+
+# ── EXPORT CSV ───────────────────────────────
+@bot.message_handler(func=lambda m: m.text == "📤 Export CSV")
+def export_csv(msg):
+    rows = get_all_transactions(msg.chat.id)
+    if not rows:
+        bot.send_message(msg.chat.id, "📭 Belum ada transaksi.", reply_markup=main_menu())
+        return
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Tipe", "Jumlah", "Kategori", "Catatan", "Tanggal"])
+    for r in rows:
+        writer.writerow([
+            "Pemasukan" if r[0] == "in" else "Pengeluaran",
+            r[1], r[2], r[3] or "", r[4]
+        ])
+    output.seek(0)
+    filename = f"money_tracker_{datetime.now().strftime('%Y%m%d')}.csv"
+    bot.send_document(msg.chat.id,
+        (filename, output.getvalue().encode("utf-8-sig")),
+        caption="📤 Data transaksi kamu!", reply_markup=main_menu())
+
+# ── INPUT HANDLER ─────────────────────────────
 @bot.message_handler(func=lambda m: m.chat.id in user_state)
 def handle_input(msg):
     uid = msg.chat.id
     state = user_state[uid]
     step = state["step"]
 
+    # TRANSAKSI
     if step == "amount":
         try:
             amt = float(msg.text.replace(".", "").replace(",", "."))
@@ -142,24 +372,96 @@ def handle_input(msg):
             state["step"] = "category"
             bot.send_message(uid, "📂 Pilih kategori:", reply_markup=cat_keyboard(state["type"]))
         except:
-            bot.send_message(uid, "❌ Angka tidak valid. Coba lagi (contoh: 50000):")
+            bot.send_message(uid, "❌ Angka tidak valid. Contoh: 50000")
 
     elif step == "category":
         state["category"] = msg.text
         state["step"] = "note"
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add("skip")
-        bot.send_message(uid, "📝 Tambah catatan? (atau tekan 'skip'):", reply_markup=kb)
+        bot.send_message(uid, "📝 Tambah catatan? (atau tekan 'skip'):", reply_markup=skip_keyboard())
 
     elif step == "note":
         note = "" if msg.text.lower() == "skip" else msg.text
         add_transaction(uid, state["type"], state["amount"], state["category"], note)
         tipe_str = "Pemasukan" if state["type"] == "in" else "Pengeluaran"
+
+        # cek budget warning
+        warning = ""
+        if state["type"] == "out":
+            budgets = get_budgets(uid)
+            for cat, limit, spent in budgets:
+                if cat == state["category"] and limit > 0:
+                    pct = spent / limit * 100
+                    if pct >= 100:
+                        warning = f"\n\n⚠️ *Budget {cat} sudah melebihi limit!*"
+                    elif pct >= 80:
+                        warning = f"\n\n⚠️ Budget {cat} sudah {pct:.0f}% terpakai!"
+
         bot.send_message(uid,
-            f"✅ *{tipe_str}* Rp {state['amount']:,.0f} ({state['category']}) tersimpan!",
+            f"✅ *{tipe_str}* Rp {state['amount']:,.0f} ({state['category']}) tersimpan!{warning}",
             parse_mode="Markdown", reply_markup=main_menu())
         del user_state[uid]
 
+    # HAPUS
+    elif step == "delete_id":
+        try:
+            tid = int(msg.text)
+            delete_transaction(tid, uid)
+            bot.send_message(uid, f"✅ Transaksi ID {tid} berhasil dihapus!", reply_markup=main_menu())
+        except:
+            bot.send_message(uid, "❌ ID tidak valid. Masukkan angka ID dari menu Riwayat.")
+        del user_state[uid]
+
+    # BUDGET
+    elif step == "budget_category":
+        state["budget_cat"] = msg.text
+        state["step"] = "budget_amount"
+        bot.send_message(uid, f"💰 Masukkan limit budget untuk *{msg.text}* (Rp):",
+                         parse_mode="Markdown", reply_markup=types.ReplyKeyboardRemove())
+
+    elif step == "budget_amount":
+        try:
+            amt = float(msg.text.replace(".", "").replace(",", "."))
+            set_budget(uid, state["budget_cat"], amt)
+            bot.send_message(uid,
+                f"✅ Budget *{state['budget_cat']}* diset Rp {amt:,.0f}/bulan!",
+                parse_mode="Markdown", reply_markup=main_menu())
+            del user_state[uid]
+        except:
+            bot.send_message(uid, "❌ Angka tidak valid. Coba lagi:")
+
+    # HUTANG
+    elif step == "debt_type":
+        if msg.text == "💰 Saya yang Hutang":
+            state["debt_type"] = "hutang"
+        else:
+            state["debt_type"] = "piutang"
+        state["step"] = "debt_person"
+        bot.send_message(uid, "👤 Nama orang/pihak terkait:", reply_markup=types.ReplyKeyboardRemove())
+
+    elif step == "debt_person":
+        state["debt_person"] = msg.text
+        state["step"] = "debt_amount"
+        bot.send_message(uid, "💰 Jumlah (Rp):")
+
+    elif step == "debt_amount":
+        try:
+            amt = float(msg.text.replace(".", "").replace(",", "."))
+            state["debt_amount"] = amt
+            state["step"] = "debt_note"
+            bot.send_message(uid, "📝 Catatan? (atau 'skip'):", reply_markup=skip_keyboard())
+        except:
+            bot.send_message(uid, "❌ Angka tidak valid.")
+
+    elif step == "debt_note":
+        note = "" if msg.text.lower() == "skip" else msg.text
+        add_debt(uid, state["debt_type"], state["debt_person"], state["debt_amount"], note)
+        tipe_str = "Hutang" if state["debt_type"] == "hutang" else "Piutang"
+        bot.send_message(uid,
+            f"✅ *{tipe_str}* Rp {state['debt_amount']:,.0f} ke/dari *{state['debt_person']}* tersimpan!\n\nGunakan /lunas [ID] kalau sudah lunas.",
+            parse_mode="Markdown", reply_markup=main_menu())
+        del user_state[uid]
+
+# ── Run ───────────────────────────────────────
 init_db()
 print("Bot berjalan...")
 bot.polling(none_stop=True)
